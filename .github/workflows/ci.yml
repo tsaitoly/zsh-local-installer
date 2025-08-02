@@ -1,0 +1,262 @@
+name: Zsh Installer CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # Lint and validate the shell script
+  shellcheck:
+    name: ShellCheck Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck -x zsh_local_installer.sh
+          echo "✅ ShellCheck passed"
+
+  # Test the installer on different Ubuntu versions
+  test-installer:
+    name: Test Installation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ubuntu_version: ['20.04', '22.04', '24.04']
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test installer in Ubuntu ${{ matrix.ubuntu_version }}
+        run: |
+          # Create test Dockerfile
+          cat > Dockerfile.test << EOF
+          FROM ubuntu:${{ matrix.ubuntu_version }}
+
+          # Set environment variables to prevent interactive prompts
+          ENV DEBIAN_FRONTEND=noninteractive
+          ENV TZ=UTC
+
+          # Configure timezone non-interactively (especially important for Ubuntu 20.04)
+          RUN ln -snf /usr/share/zoneinfo/\$TZ /etc/localtime && echo \$TZ > /etc/timezone
+
+          # Install required dependencies
+          RUN apt-get update && apt-get install -y \\
+              build-essential \\
+              wget \\
+              curl \\
+              git \\
+              autoconf \\
+              pkg-config \\
+              sudo \\
+              tzdata
+
+          # Reset DEBIAN_FRONTEND for normal operation
+          ENV DEBIAN_FRONTEND=
+
+          # Create test user
+          RUN useradd -m -s /bin/bash testuser && \\
+              echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+          # Copy installer script
+          COPY zsh_local_installer.sh /home/testuser/
+          RUN chown testuser:testuser /home/testuser/zsh_local_installer.sh && \\
+              chmod +x /home/testuser/zsh_local_installer.sh
+
+          USER testuser
+          WORKDIR /home/testuser
+
+          # Set PATH for zsh installation
+          ENV PATH="/home/testuser/.local/bin:$PATH"
+
+          # Test the installer
+          RUN timeout 1800 ./zsh_local_installer.sh || (echo "Installation failed or timed out" && exit 1)
+
+          # Verify installation
+          RUN test -f ~/.local/bin/zsh && echo "✅ Zsh binary exists"
+          RUN ~/.local/bin/zsh --version && echo "✅ Zsh runs successfully"
+          RUN test -d ~/.oh-my-zsh && echo "✅ Oh-my-zsh installed"
+          RUN test -f ~/.zshrc && echo "✅ .zshrc created"
+
+          # Test zsh execution with configuration
+          RUN timeout 10 ~/.local/bin/zsh -c "echo 'Zsh with oh-my-zsh works!'" && echo "✅ Zsh configuration works"
+          EOF
+
+          # Build and run test
+          docker build -f Dockerfile.test -t zsh-installer-test:${{ matrix.ubuntu_version }} .
+          echo "✅ Installation test passed for Ubuntu ${{ matrix.ubuntu_version }}"
+
+  # Test as root user
+  test-root-install:
+    name: Test Root Installation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget curl git autoconf pkg-config
+
+      - name: Test installer as root
+        run: |
+          chmod +x zsh_local_installer.sh
+          sudo timeout 1800 ./zsh_local_installer.sh
+
+          # Verify installation
+          test -f /usr/local/bin/zsh && echo "✅ Zsh binary exists in /usr/local/bin"
+          /usr/local/bin/zsh --version && echo "✅ Zsh runs successfully"
+          sudo -u $USER test -d ~/.oh-my-zsh && echo "✅ Oh-my-zsh installed"
+          sudo -u $USER test -f ~/.zshrc && echo "✅ .zshrc created"
+
+  # Security scan
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Bandit security scan
+        run: |
+          # Basic security checks for shell script
+          if grep -n "eval\|exec.*\$" zsh_local_installer.sh; then
+            echo "⚠️  Warning: Found potentially dangerous eval/exec usage"
+          fi
+
+          if grep -n "curl.*|.*sh\|wget.*|.*sh" zsh_local_installer.sh; then
+            echo "ℹ️  Note: Script downloads and executes remote content (oh-my-zsh installer)"
+          fi
+
+          if grep -n "rm -rf /\|rm -rf \$HOME" zsh_local_installer.sh; then
+            echo "❌ Error: Found dangerous rm commands"
+            exit 1
+          fi
+
+          echo "✅ Basic security scan passed"
+
+  # Create release when tag is pushed
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [shellcheck, test-installer, test-root-install, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Zsh Manual Installer ${{ github.ref_name }}
+          body: |
+            ## Zsh Manual Installer Release ${{ github.ref_name }}
+
+            ### Features
+            - 🚀 Install Zsh from source without apt/package managers
+            - 📦 Automatically builds and installs ncurses dependency
+            - 🎨 Sets up oh-my-zsh with sensible defaults
+            - 👤 Supports both root and user installations
+            - 🔧 Works on Ubuntu 20.04, 22.04, and 24.04
+
+            ### Usage
+            ```bash
+            # Download the installer
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/zsh_local_installer.sh
+
+            # Make it executable
+            chmod +x zsh_local_installer.sh
+
+            # Run the installer
+            ./zsh_local_installer.sh
+
+            # Start using zsh
+            exec ~/.local/bin/zsh  # for user installation
+            # or
+            exec /usr/local/bin/zsh  # for root installation
+            ```
+
+            ### Requirements
+            - Ubuntu Linux (18.04+)
+            - Pre-installed: gcc, make, wget, curl, git, autoconf, pkg-config
+
+            ### Installation Locations
+            - **User installation**: `~/.local/` (recommended)
+            - **Root installation**: `/usr/local/`
+
+            ---
+
+            **Full Changelog**: https://github.com/${{ github.repository }}/compare/v1.0.0...${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./zsh_local_installer.sh
+          asset_name: zsh_local_installer.sh
+          asset_content_type: application/x-sh
+
+  # Notification job
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [shellcheck, test-installer, test-root-install, security-scan]
+    if: always()
+
+    steps:
+      - name: Check job results
+        run: |
+          if [[ "${{ needs.shellcheck.result }}" == "success" && \
+                "${{ needs.test-installer.result }}" == "success" && \
+                "${{ needs.test-root-install.result }}" == "success" && \
+                "${{ needs.security-scan.result }}" == "success" ]]; then
+            echo "🎉 All CI/CD checks passed!"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Some CI/CD checks failed"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        id: check_status
+
+      - name: Summary
+        run: |
+          echo "## 🔍 CI/CD Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ShellCheck | ${{ needs.shellcheck.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Installation Tests | ${{ needs.test-installer.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Root Installation Test | ${{ needs.test-root-install.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ steps.check_status.outputs.status }}" == "success" ]]; then
+            echo "🎉 **All checks passed!** The zsh installer is ready for use." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Some checks failed.** Please review the logs above." >> $GITHUB_STEP_SUMMARY
+          fi
