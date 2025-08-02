@@ -64,7 +64,7 @@ install_build_deps() {
     # Check if essential tools are available
     local missing_tools=()
 
-    for tool in gcc make wget curl git autoconf pkg-config; do
+    for tool in gcc make wget curl git pkg-config; do
         if ! command -v "$tool" &> /dev/null; then
             missing_tools+=("$tool")
         fi
