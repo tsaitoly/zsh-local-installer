@@ -6,7 +6,8 @@ Tool to user-install zsh
 *   `git`
 *   `wget`
 *   `curl`
-*   `cmake`
+*   `make`
+*   `gcc`
 *   `pkg-config`
 
 ## Usage
